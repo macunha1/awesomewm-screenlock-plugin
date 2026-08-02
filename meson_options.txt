@@ -1,0 +1,1 @@
+option('lua-version', type: 'string', value: '5.1', description: 'Lua module ABI directory')
