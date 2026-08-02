@@ -31,7 +31,10 @@
             meson
             ninja
             pkg-config
+            luajit
           ];
+
+          mesonFlags = [ "-Dlua-version=5.1" ];
 
           buildInputs = with pkgs; [
             libxcb
@@ -41,13 +44,15 @@
             ffmpeg
           ];
 
-          passthru.luaModulePaths = [ "share/lua/5.1" "share/lua/5.2" ];
+          passthru.luaModulePaths = [ "share/lua/5.1" ];
+          passthru.luaModule = "share/lua/5.1";
 
           meta = {
             description = "AwesomeWM screenlock plugin with a Lua API and XCB/PAM helper";
             homepage = "https://github.com/macunha1/awesomewm-screenlock-plugin";
             license = pkgs.lib.licenses.mit;
             platforms = pkgs.lib.platforms.linux;
+            mainProgram = "awesomewm-screenlock-helper";
           };
         };
     in

@@ -6,12 +6,14 @@
 #include <security/pam_appl.h>
 #include <xcb/xcb.h>
 #include <xcb/xcb_keysyms.h>
+#include <xcb/xinerama.h>
 #include <X11/keysym.h>
 
 #include <signal.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <pwd.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +22,13 @@
 enum {
     PASSWORD_CAPACITY = 256,
     FAILURE_DISPLAY_TICKS = 20,
+};
+
+struct lock_display {
+    int16_t x;
+    int16_t y;
+    uint16_t width;
+    uint16_t height;
 };
 
 struct lock_state {
@@ -47,6 +56,8 @@ struct lock_state {
     pthread_t capture_thread;
     int capture_thread_started;
     int background_ready;
+    struct lock_display *displays;
+    size_t display_count;
 };
 
 struct pam_data {
@@ -134,16 +145,26 @@ static void draw_rect(
     xcb_poly_fill_rectangle(state->connection, state->window, state->graphics, 1, &rectangle);
 }
 
+/*
+ * Calculate prompt geometry relative to one physical display.
+ *
+ * The lock window covers the full X11 root, but a prompt belongs to one
+ * Xinerama rectangle. Keeping the rectangle in this function prevents a
+ * multi-display layout from being treated as one oversized screen.
+ */
 static void prompt_geometry(
     const struct lock_state *state,
+    const struct lock_display *display,
     int16_t *left,
     int16_t *top,
     uint16_t *width,
     uint16_t *height
 )
 {
-    const int16_t center_x = (int16_t)(state->screen->width_in_pixels / 2);
-    const int16_t center_y = (int16_t)(state->screen->height_in_pixels / 2);
+    const int16_t center_x = display->x + (int16_t)(display->width / 2);
+    const int16_t center_y = display->y + (int16_t)(display->height / 2);
+
+    (void)state;
 
     *width = 320;
     *height = 72;
@@ -188,7 +209,17 @@ static void draw_background_rows(
     }
 }
 
-static void draw_prompt(struct lock_state *state)
+/*
+ * Draw the shared prompt state on one display.
+ *
+ * Contract: `state` contains the current password length, flash state, and
+ * failure state. The function reads those values only; drawing each display
+ * from the same state keeps colors and password dots synchronized.
+ */
+static void draw_prompt_on_display(
+    struct lock_state *state,
+    const struct lock_display *display
+)
 {
     int16_t left;
     int16_t top;
@@ -200,7 +231,9 @@ static void draw_prompt(struct lock_state *state)
     const uint32_t prompt_background = state->prompt_inverted ? white : black;
     const uint32_t red = white;
 
-    prompt_geometry(state, &left, &top, &box_width, &box_height);
+    prompt_geometry(
+        state, display, &left, &top, &box_width, &box_height
+    );
     xcb_clear_area(state->connection, 0, state->window, left, top,
                    box_width, box_height);
     draw_rect(state, left, top, box_width, box_height, prompt_foreground);
@@ -212,6 +245,95 @@ static void draw_prompt(struct lock_state *state)
         int16_t dot_y = top + 18 + (int16_t)(index / 24) * 16;
         draw_rect(state, dot_x, dot_y, 7, 7, prompt_foreground);
     }
+}
+
+/*
+ * Draw the prompt on every active Xinerama display.
+ *
+ * Xinerama reports monitor rectangles in root-window coordinates, so one lock
+ * window can contain all prompts. If display discovery is unavailable, the
+ * initialized fallback rectangle still gives the user one centered prompt.
+ */
+static void draw_prompt(struct lock_state *state)
+{
+    for (size_t index = 0; index < state->display_count; index++)
+        draw_prompt_on_display(state, &state->displays[index]);
+}
+
+/*
+ * Use the root rectangle as the one-display fallback.
+ *
+ * Contract: `state->screen` must be initialized. The allocated layout is
+ * owned by `state` and is released by destroy_lock_window(). This fallback is
+ * also the normal path on X servers without the Xinerama extension.
+ */
+static int use_root_display_layout(struct lock_state *state)
+{
+    state->displays = calloc(1, sizeof(*state->displays));
+    if (state->displays == NULL)
+        return 0;
+    state->displays[0] = (struct lock_display){
+        .width = state->screen->width_in_pixels,
+        .height = state->screen->height_in_pixels,
+    };
+    state->display_count = 1;
+    return 1;
+}
+
+/*
+ * Discover active monitor rectangles for prompt placement.
+ *
+ * Xinerama coordinates are root-window coordinates, which means the lock
+ * surface can remain a single fullscreen window while each prompt is centered
+ * on its own display. Failure to query the extension is non-fatal: the root
+ * rectangle preserves the existing single-prompt behavior.
+ */
+static int discover_display_layout(struct lock_state *state)
+{
+    const xcb_query_extension_reply_t *extension;
+    xcb_xinerama_query_screens_reply_t *reply;
+    xcb_xinerama_screen_info_t *screens;
+    struct lock_display *displays;
+    int screen_count;
+
+    if (!use_root_display_layout(state))
+        return 0;
+    extension = xcb_get_extension_data(
+        state->connection, &xcb_xinerama_id
+    );
+    if (extension == NULL || !extension->present)
+        return 1;
+    reply = xcb_xinerama_query_screens_reply(
+        state->connection,
+        xcb_xinerama_query_screens(state->connection),
+        NULL
+    );
+    if (reply == NULL)
+        return 1;
+    screen_count = xcb_xinerama_query_screens_screen_info_length(reply);
+    screens = xcb_xinerama_query_screens_screen_info(reply);
+    if (screen_count <= 0 || screens == NULL) {
+        free(reply);
+        return 1;
+    }
+    displays = calloc((size_t)screen_count, sizeof(*displays));
+    if (displays == NULL) {
+        free(reply);
+        return 0;
+    }
+    free(state->displays);
+    for (int index = 0; index < screen_count; index++) {
+        displays[index] = (struct lock_display){
+            .x = screens[index].x_org,
+            .y = screens[index].y_org,
+            .width = screens[index].width,
+            .height = screens[index].height,
+        };
+    }
+    state->displays = displays;
+    state->display_count = (size_t)screen_count;
+    free(reply);
+    return 1;
 }
 
 static uint32_t visual_component(uint8_t value, uint32_t mask);
@@ -545,6 +667,9 @@ static int create_lock_window(struct lock_state *state)
 
 static void destroy_lock_window(struct lock_state *state)
 {
+    free(state->displays);
+    state->displays = NULL;
+    state->display_count = 0;
     if (state->connection == NULL)
         return;
 
@@ -585,6 +710,7 @@ int awesomewm_screenlock_run(const char *pam_service, const char *user)
     state.screen = iterator.data;
     state.key_symbols = xcb_key_symbols_alloc(state.connection);
     if (state.screen == NULL || state.key_symbols == NULL
+        || !discover_display_layout(&state)
         || !prepare_background_storage(&state)
         || !start_capture_worker(&state)
         || !finish_capture_before_lock(&state)

@@ -4,11 +4,11 @@
   <img src="./screenshots/screenlock-single-display.png" alt="AwesomeWM screenlock on a single display" width="960" />
 </p>
     
-`awesomewm-screenlock-plugin` implement a C + Lua native screenlock plugin that
-takes the last visible desktop and turn it into a frozen, blurred image that is
-used as the lock screen background. Creating dynamic lock screen images every
-time based on what was on the screen (without letting anyone else see the actual
-content).
+`awesomewm-screenlock-plugin` implements a C + Lua native screenlock plugin
+that takes the last visible desktop and turns it into a frozen, privacy-filtered
+image used as the lock screen background. The image is captured and filtered
+before the lock window is mapped, so the unfiltered desktop is never rendered
+by the locker.
 
 This repository exists for AwesomeWM users who want that experience without
 putting the sensitive parts of locking inside the window manager's Lua process,
@@ -30,7 +30,7 @@ black. This plugin keeps the session recognizable while making the content
 hard to read, so locking feels deliberate without giving away what was on the
 screen.
 
-- Keep the desktop's visual context with a blurred and pixelated snapshot
+- Keep the desktop's visual context with a noisy, scaled, and pixelated snapshot
   instead of replacing it with a generic blank screen.
 - Protect privacy by making the previous desktop difficult to inspect at a
   glance (the goal is privacy, not decoration).
@@ -108,8 +108,8 @@ in
 The helper uses the `xlock` PAM service by default and reads
 `AWESOMEWM_SCREENLOCK_PAM_SERVICE` when another service is required.
 
-The helper captures the desktop before mapping the lock surface, then applies
-a privacy filter that makes the previous desktop look frozen and blurred:
+The helper starts a native capture worker, waits for its filtered frame, and
+only then maps the lock surface. FFmpeg applies the privacy filter:
 
 ```text
 noise=alls=10,scale=iw*.05:-1,scale=iw*20:-1:flags=neighbor
@@ -121,14 +121,17 @@ effect is practical rather than decorative: it preserves the context of the
 session without leaving the previous desktop legible to someone looking over
 your shoulder.
 
+When Xinerama reports multiple active displays, the helper draws the same
+prompt state at the center of every display. Password dots, foreground and
+background colors, and the flashing state are shared, so the prompts remain
+consistent while the lock surface still covers the complete X11 root window.
+
 ### Security concerns
 
-Lua owns configuration and process lifecycle. C owns Xorg screenshot, FFmpeg
-image editing to blur, the fullscreen XCB window, password input, and PAM
-authentication. The password never crosses into Lua, PAM authentication is
-managed completely by the (C) helper, which keeps AwesomeWM's scripting layer
-out of the credential path and limits the native helper's responsibilities to
-the parts that need direct access to the display and authentication stack.
+Lua owns configuration and the helper process lifecycle. C owns the X11/XCB
+capture and lock surface, FFmpeg filtering, keyboard input, and PAM
+authentication. The password is held only in the native helper and never
+crosses into Lua or the AwesomeWM process.
 
 This is an X11 locker, not a general-purpose desktop security boundary. It is
 designed to protect a screen from ordinary nearby observation and to keep user
