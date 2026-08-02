@@ -67,6 +67,7 @@ int awesomewm_screenlock_capture(
     memset(capture, 0, sizeof(*capture));
 
     avdevice_register_all();
+    av_log_set_level(AV_LOG_ERROR);
     input_format = av_find_input_format("x11grab");
     if (input_format == NULL)
         return fail(AVERROR_DECODER_NOT_FOUND, "x11grab input is unavailable");

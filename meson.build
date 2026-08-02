@@ -41,11 +41,13 @@ test_helper = find_program('tests/test-helper.sh')
 test('helper usage', test_helper, args: [helper])
 
 install_headers('include/awesomewm_screenlock.h')
-install_subdir(
-  'lua/awesomewm_screenlock',
-  install_dir: get_option('datadir') / 'lua' / get_option('lua-version'),
-)
-install_subdir(
-  'lua/plugins',
-  install_dir: get_option('datadir') / 'lua' / get_option('lua-version'),
-)
+foreach lua_version : ['5.1', '5.2']
+  install_subdir(
+    'lua/awesomewm_screenlock',
+    install_dir: get_option('datadir') / 'lua' / lua_version,
+  )
+  install_subdir(
+    'lua/plugins',
+    install_dir: get_option('datadir') / 'lua' / lua_version,
+  )
+endforeach

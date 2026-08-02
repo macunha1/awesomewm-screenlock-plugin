@@ -137,20 +137,43 @@ static void draw(struct lock_state *state)
     xcb_clear_area(state->connection, 0, state->window, 0, 0,
                    state->screen->width_in_pixels, state->screen->height_in_pixels);
 
-    xcb_put_image(
-        state->connection,
-        XCB_IMAGE_FORMAT_Z_PIXMAP,
-        state->window,
-        state->graphics,
-        state->screen->width_in_pixels,
-        state->screen->height_in_pixels,
-        0,
-        0,
-        0,
-        state->screen->root_depth,
-        (uint32_t)(state->background_stride * state->screen->height_in_pixels),
-        state->background
-    );
+    /*
+     * X11 limits the size of one PutImage request. Send a few rows at a time
+     * so a 1080p or 4K background cannot invalidate the X connection before
+     * the password surface is drawn.
+     */
+    for (int y = 0; y < state->screen->height_in_pixels; y += 4) {
+        uint16_t rows = (uint16_t)(state->screen->height_in_pixels - y);
+        xcb_void_cookie_t image_cookie;
+        xcb_generic_error_t *image_error;
+
+        if (rows > 4)
+            rows = 4;
+        image_cookie = xcb_put_image_checked(
+            state->connection,
+            XCB_IMAGE_FORMAT_Z_PIXMAP,
+            state->window,
+            state->graphics,
+            state->screen->width_in_pixels,
+            rows,
+            0,
+            (int16_t)y,
+            0,
+            state->screen->root_depth,
+            (uint32_t)(state->background_stride * rows),
+            state->background + y * state->background_stride
+        );
+        image_error = xcb_request_check(state->connection, image_cookie);
+        if (image_error != NULL) {
+            fprintf(
+                stderr,
+                "awesomewm-screenlock: XCB background tile failed (code %u)\n",
+                image_error->error_code
+            );
+            free(image_error);
+            break;
+        }
+    }
 
     draw_rect(state, left, top, box_width, box_height, white);
     draw_rect(state, left + 4, top + 4, box_width - 8, box_height - 8,

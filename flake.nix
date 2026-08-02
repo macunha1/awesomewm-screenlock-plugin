@@ -15,6 +15,12 @@
       packageFor = system:
         let
           pkgs = import nixpkgs { inherit system; };
+          ffmpeg = pkgs.ffmpeg.override {
+            withXcb = true;
+            withXcbShm = true;
+            withXcbShape = true;
+            withXcbxfixes = true;
+          };
         in
         pkgs.stdenv.mkDerivation {
           pname = "awesomewm-screenlock-plugin";
@@ -35,7 +41,7 @@
             ffmpeg
           ];
 
-          passthru.luaModulePath = "share/lua/5.1";
+          passthru.luaModulePaths = [ "share/lua/5.1" "share/lua/5.2" ];
 
           meta = {
             description = "AwesomeWM screenlock plugin with a Lua API and XCB/PAM helper";
@@ -55,6 +61,12 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+          ffmpeg = pkgs.ffmpeg.override {
+            withXcb = true;
+            withXcbShm = true;
+            withXcbShape = true;
+            withXcbxfixes = true;
+          };
         in
         {
           default = pkgs.mkShell {
