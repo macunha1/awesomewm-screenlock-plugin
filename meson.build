@@ -15,6 +15,7 @@ avfilter = dependency('libavfilter')
 avformat = dependency('libavformat')
 avutil = dependency('libavutil')
 swscale = dependency('libswscale')
+threads = dependency('threads')
 
 ffmpeg = [avcodec, avdevice, avfilter, avformat, avutil, swscale]
 
@@ -23,7 +24,7 @@ screenlock = library(
   'src/screenlock.c',
   'src/capture.c',
   include_directories: include_directories('include'),
-  dependencies: [pam, x11, xcb, xcb_keysyms, ffmpeg],
+  dependencies: [pam, x11, xcb, xcb_keysyms, threads, ffmpeg],
   install: true,
 )
 
@@ -31,7 +32,7 @@ helper = executable(
   'awesomewm-screenlock-helper',
   'src/helper.c',
   include_directories: include_directories('include'),
-  dependencies: [pam, x11, xcb, xcb_keysyms, ffmpeg],
+  dependencies: [pam, x11, xcb, xcb_keysyms, threads, ffmpeg],
   link_with: screenlock,
   install_rpath: '$ORIGIN/../lib',
   install: true,

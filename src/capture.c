@@ -72,16 +72,25 @@ int awesomewm_screenlock_capture(
     if (input_format == NULL)
         return fail(AVERROR_DECODER_NOT_FOUND, "x11grab input is unavailable");
 
+    /*
+     * This is a one-frame capture, not a media session. Keep x11grab from
+     * waiting for a large probe window and avoid spending time collecting
+     * cursor data that the lock surface will never display.
+     */
     av_dict_set(&options, "video_size", resolution, 0);
     av_dict_set(&options, "framerate", "1", 0);
     av_dict_set(&options, "draw_mouse", "0", 0);
+    av_dict_set(&options, "probesize", "32", 0);
+    av_dict_set(&options, "analyzeduration", "0", 0);
     result = avformat_open_input(&input, display, input_format, &options);
     av_dict_free(&options);
     if (result < 0)
         goto cleanup;
-    result = avformat_find_stream_info(input, NULL);
-    if (result < 0)
+    /* x11grab creates its video stream during avformat_open_input(). */
+    if (input->nb_streams == 0) {
+        result = AVERROR_STREAM_NOT_FOUND;
         goto cleanup;
+    }
 
     for (unsigned int index = 0; index < input->nb_streams; index++) {
         if (input->streams[index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -170,6 +179,11 @@ int awesomewm_screenlock_capture(
     if (result < 0)
         goto cleanup;
 
+    /*
+     * Decode only until the first filtered frame is available. The filter
+     * graph performs the privacy transformation before the image crosses
+     * into the lock renderer, so the unfiltered desktop is never displayed.
+     */
     while (!frame_received && (result = av_read_frame(input, packet)) >= 0) {
         if (packet->stream_index == video_stream) {
             result = avcodec_send_packet(decoder, packet);
@@ -209,7 +223,8 @@ int awesomewm_screenlock_capture(
                     capture->width = rgb->width;
                     capture->height = rgb->height;
                     capture->stride = rgb->linesize[0];
-                    capture->pixels = malloc(
+                        /* Transfer a compact, private copy out of FFmpeg. */
+                        capture->pixels = malloc(
                         (size_t)capture->stride * (size_t)capture->height
                     );
                     if (capture->pixels == NULL)
