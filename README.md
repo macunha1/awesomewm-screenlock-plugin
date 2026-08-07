@@ -47,6 +47,7 @@ implement AwesomeWM's workflow and LuaJIT configuration model.
 - AwesomeWM 4.x
 - Lua or LuaJIT with `awful.spawn`
 - X11 with XCB
+- Xft and a fontconfig-provided font for native status messages
 - PAM configured with an `xlock` service
 - FFmpeg libraries with the `x11grab` input and video filters
 
@@ -61,6 +62,49 @@ awful.key({ modkey }, "Home", function()
     screenlock:lock()
 end)
 ```
+
+### Lockdown and AwesomeWM integration
+
+The Lua module starts the native helper as a separate process. `lockDown` is
+enabled by default, which means the helper covers the complete root window and
+grabs keyboard and pointer input. This is the secure mode: Awesome remains
+responsive as a process, but its widgets are not visible or interactive while
+the password surface is active.
+
+Disabling lockdown is an explicit usability trade-off:
+
+```lua
+local screenlock = require("awesomewm_screenlock")({
+    lockDown = {
+        -- false keeps the real Awesome wibar above the native lock surface.
+        enabled = false,
+        -- Empty means every action in the integrated wibar is allowed.
+        allowedActions = {},
+    },
+    -- Required in integrated mode. The function returns real wibar XIDs.
+    wibarWindows = function()
+        return { screen.primary.mywibar.window }
+    end,
+})
+```
+
+Integrated mode is not a full security boundary. The real Awesome wibar stays
+visible and its callbacks can run, including commands that launch applications
+or change the desktop. `allowedActions` is reserved for a future action
+registry; arbitrary Awesome widget callbacks cannot be inferred safely from
+X11 window IDs. Until those widgets are explicitly registered, an empty list
+means all integrated actions are allowed.
+
+The helper also accepts bounded MessagePack notification messages through the
+private control socket configured by `controlSocket`:
+
+```lua
+screenlock:notify("Battery low", "Battery level: 12%", "warning")
+```
+
+Notifications are rendered by the native helper and never carry passwords or
+commands. The socket is intended for display state such as battery, media,
+clock, and user notifications.
 
 You can find an implementation reference at
 [macunha1/aweswm](https://github.com/macunha1/aweswm/commit/51b19d8c4802cde4d5a3891ea2afbfd7bb20b2d4)
@@ -107,6 +151,12 @@ in
 
 The helper uses the `xlock` PAM service by default and reads
 `AWESOMEWM_SCREENLOCK_PAM_SERVICE` when another service is required.
+
+When PAM rejects a password, the native surface clears the password, switches
+to the next prompt color combination, and displays `Authentication failed` on
+every active display. The message uses the same foreground color as that
+prompt state. The next key press clears the message and restores the default
+prompt colors before accepting the next password.
 
 The helper starts a native capture worker, waits for its filtered frame, and
 only then maps the lock surface. FFmpeg applies the privacy filter:

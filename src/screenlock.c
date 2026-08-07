@@ -2,12 +2,15 @@
 
 #include "awesomewm_screenlock.h"
 #include "awesomewm_screenlock_capture.h"
+#include "awesomewm_screenlock_control.h"
 
 #include <security/pam_appl.h>
 #include <xcb/xcb.h>
 #include <xcb/xcb_keysyms.h>
 #include <xcb/xinerama.h>
 #include <X11/keysym.h>
+#include <X11/Xlib.h>
+#include <X11/Xft/Xft.h>
 
 #include <signal.h>
 #include <stdatomic.h>
@@ -21,7 +24,6 @@
 
 enum {
     PASSWORD_CAPACITY = 256,
-    FAILURE_DISPLAY_TICKS = 20,
 };
 
 struct lock_display {
@@ -42,8 +44,10 @@ struct lock_state {
     const char *user;
     char password[PASSWORD_CAPACITY];
     size_t password_length;
-    unsigned failure_ticks;
     unsigned prompt_inverted;
+    char status_message[64];
+    Display *text_display;
+    XftFont *text_font;
     struct screenlock_capture capture;
     uint8_t *background;
     int background_stride;
@@ -58,6 +62,13 @@ struct lock_state {
     int background_ready;
     struct lock_display *displays;
     size_t display_count;
+    int lockdown_enabled;
+    const uint32_t *wibar_windows;
+    size_t wibar_window_count;
+    struct screenlock_control control;
+    char notification_level[16];
+    char notification_title[128];
+    char notification_text[1024];
 };
 
 struct pam_data {
@@ -146,6 +157,91 @@ static void draw_rect(
 }
 
 /*
+ * Order pending XCB fills before drawing text through the Xft connection.
+ *
+ * Contract: the XCB connection and lock window must be initialized. Xft uses
+ * a separate Xlib connection, so flushing alone does not establish ordering
+ * between the prompt background and the status text. The reply makes the
+ * queued XCB rectangles complete before Xft paints over them.
+ */
+static int synchronize_prompt_background(struct lock_state *state)
+{
+    xcb_get_input_focus_cookie_t cookie =
+        xcb_get_input_focus(state->connection);
+    xcb_get_input_focus_reply_t *reply =
+        xcb_get_input_focus_reply(state->connection, cookie, NULL);
+    int success = reply != NULL;
+
+    free(reply);
+    return success;
+}
+
+/*
+ * Draw a short status message using the prompt's current foreground color.
+ *
+ * Contract: the Xft display and font must be initialized, and `message` must
+ * be UTF-8. The Xft resources are transient because the lock surface can be
+ * redrawn after an expose event; the shared prompt state remains in C.
+ */
+static void draw_status_message(
+    struct lock_state *state,
+    int16_t left,
+    int16_t top,
+    uint16_t width,
+    uint32_t color,
+    const char *message
+)
+{
+    XftDraw *draw;
+    XftColor text_color;
+    XGlyphInfo text_extents;
+    XRenderColor render_color = {
+        .red = color == state->screen->white_pixel ? 0xffff : 0,
+        .green = color == state->screen->white_pixel ? 0xffff : 0,
+        .blue = color == state->screen->white_pixel ? 0xffff : 0,
+        .alpha = 0xffff,
+    };
+    int screen_number;
+
+    if (state->text_display == NULL || state->text_font == NULL)
+        return;
+    if (!synchronize_prompt_background(state))
+        return;
+    screen_number = DefaultScreen(state->text_display);
+    draw = XftDrawCreate(
+        state->text_display, state->window,
+        DefaultVisual(state->text_display, screen_number),
+        DefaultColormap(state->text_display, screen_number)
+    );
+    if (draw == NULL)
+        return;
+    if (XftColorAllocValue(
+            state->text_display,
+            DefaultVisual(state->text_display, screen_number),
+            DefaultColormap(state->text_display, screen_number),
+            &render_color, &text_color
+    )) {
+        XftTextExtentsUtf8(
+            state->text_display, state->text_font,
+            (const FcChar8 *)message, strlen(message), &text_extents
+        );
+        XftDrawStringUtf8(
+            draw, &text_color, state->text_font,
+            left + (int16_t)(width / 2) - (int16_t)(text_extents.width / 2),
+            top + 46, (const FcChar8 *)message, strlen(message)
+        );
+        XftColorFree(
+            state->text_display,
+            DefaultVisual(state->text_display, screen_number),
+            DefaultColormap(state->text_display, screen_number),
+            &text_color
+        );
+    }
+    XftDrawDestroy(draw);
+    XFlush(state->text_display);
+}
+
+/*
  * Calculate prompt geometry relative to one physical display.
  *
  * The lock window covers the full X11 root, but a prompt belongs to one
@@ -229,7 +325,6 @@ static void draw_prompt_on_display(
     const uint32_t black = state->screen->black_pixel;
     const uint32_t prompt_foreground = state->prompt_inverted ? black : white;
     const uint32_t prompt_background = state->prompt_inverted ? white : black;
-    const uint32_t red = white;
 
     prompt_geometry(
         state, display, &left, &top, &box_width, &box_height
@@ -238,12 +333,36 @@ static void draw_prompt_on_display(
                    box_width, box_height);
     draw_rect(state, left, top, box_width, box_height, prompt_foreground);
     draw_rect(state, left + 4, top + 4, box_width - 8, box_height - 8,
-              state->failure_ticks > 0 ? red : prompt_background);
+              prompt_background);
 
-    for (size_t index = 0; index < state->password_length; index++) {
-        int16_t dot_x = left + 18 + (int16_t)(index % 24) * 12;
-        int16_t dot_y = top + 18 + (int16_t)(index / 24) * 16;
-        draw_rect(state, dot_x, dot_y, 7, 7, prompt_foreground);
+    if (state->status_message[0] != '\0')
+        draw_status_message(
+            state, left, top, box_width, prompt_foreground,
+            state->status_message
+        );
+    else
+        for (size_t index = 0; index < state->password_length; index++) {
+            int16_t dot_x = left + 18 + (int16_t)(index % 24) * 12;
+            int16_t dot_y = top + 18 + (int16_t)(index / 24) * 16;
+            draw_rect(state, dot_x, dot_y, 7, 7, prompt_foreground);
+        }
+
+    if (state->notification_text[0] != '\0') {
+        int16_t notification_left = display->x + 8;
+        int16_t notification_top = display->y + 8;
+        uint16_t notification_width = display->width - 16;
+
+        draw_rect(
+            state, notification_left, notification_top,
+            notification_width, 48, prompt_background
+        );
+        draw_status_message(
+            state, notification_left, notification_top,
+            notification_width, prompt_foreground,
+            state->notification_title[0] != '\0'
+                ? state->notification_title
+                : state->notification_text
+        );
     }
 }
 
@@ -591,6 +710,73 @@ static int authenticate(struct lock_state *state)
     return result == PAM_SUCCESS;
 }
 
+/*
+ * Open the font renderer used for native status messages.
+ *
+ * Contract: the XCB connection and screen must already exist. The renderer
+ * is separate from the XCB connection because Xft owns its Xlib resources;
+ * both connections target the same X11 server and the Xft calls stay on the
+ * lock event-loop thread.
+ */
+static int prepare_text_renderer(struct lock_state *state)
+{
+    state->text_display = XOpenDisplay(NULL);
+    if (state->text_display == NULL)
+        return 0;
+    state->text_font = XftFontOpenName(
+        state->text_display, DefaultScreen(state->text_display), "Sans-14"
+    );
+    if (state->text_font == NULL) {
+        XCloseDisplay(state->text_display);
+        state->text_display = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Clear a previous authentication status before accepting new input.
+ *
+ * The failed submission is rendered with the next foreground/background
+ * combination. The next key press returns the prompt to its default colors,
+ * which prevents the error state from leaking into the next password entry.
+ */
+static void reset_status_message(struct lock_state *state)
+{
+    if (state->status_message[0] == '\0')
+        return;
+    state->status_message[0] = '\0';
+    state->prompt_inverted = 0;
+}
+
+/*
+ * Apply one validated notification from AwesomeWM to the lock surface.
+ *
+ * Notification text is display state, not a command. It is copied into fixed
+ * buffers so the helper never retains pointers into the control socket's
+ * receive buffer and cannot accept an unbounded allocation from the WM.
+ */
+static void apply_notification(
+    struct lock_state *state,
+    const struct screenlock_control_notification *notification
+)
+{
+    if (notification->text[0] == '\0')
+        return;
+    snprintf(
+        state->notification_level, sizeof(state->notification_level),
+        "%s", notification->level
+    );
+    snprintf(
+        state->notification_title, sizeof(state->notification_title),
+        "%s", notification->title
+    );
+    snprintf(
+        state->notification_text, sizeof(state->notification_text),
+        "%s", notification->text
+    );
+}
+
 static int create_lock_window(struct lock_state *state)
 {
     uint32_t values[] = {
@@ -602,6 +788,14 @@ static int create_lock_window(struct lock_state *state)
     xcb_grab_keyboard_reply_t *keyboard_reply;
     xcb_grab_pointer_reply_t *pointer_reply;
     xcb_void_cookie_t cookie;
+
+    if (!state->lockdown_enabled && state->wibar_window_count == 0) {
+        fprintf(
+            stderr,
+            "awesomewm-screenlock: integrated mode requires at least one wibar window\n"
+        );
+        return 0;
+    }
 
     state->window = xcb_generate_id(state->connection);
     xcb_create_window(
@@ -623,8 +817,24 @@ static int create_lock_window(struct lock_state *state)
     state->graphics = xcb_generate_id(state->connection);
     xcb_create_gc(state->connection, state->graphics, state->window, 0, NULL);
     xcb_map_window(state->connection, state->window);
+    if (!state->lockdown_enabled && state->wibar_window_count > 0) {
+        uint32_t stacking[] = {
+            state->wibar_windows[0],
+            XCB_STACK_MODE_BELOW,
+        };
+
+        /* Keep the real Awesome wibar above the native lock surface. */
+        xcb_configure_window(
+            state->connection, state->window,
+            XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE,
+            stacking
+        );
+    }
     xcb_set_input_focus(state->connection, XCB_INPUT_FOCUS_PARENT,
                         state->window, XCB_CURRENT_TIME);
+
+    if (!state->lockdown_enabled)
+        return xcb_connection_has_error(state->connection) == 0;
 
     keyboard_reply = xcb_grab_keyboard_reply(
         state->connection,
@@ -667,6 +877,7 @@ static int create_lock_window(struct lock_state *state)
 
 static void destroy_lock_window(struct lock_state *state)
 {
+    screenlock_control_close(&state->control);
     free(state->displays);
     state->displays = NULL;
     state->display_count = 0;
@@ -683,9 +894,19 @@ static void destroy_lock_window(struct lock_state *state)
     free(state->background);
     state->background = NULL;
     awesomewm_screenlock_capture_free(&state->capture);
+    if (state->text_font != NULL)
+        XftFontClose(state->text_display, state->text_font);
+    if (state->text_display != NULL)
+        XCloseDisplay(state->text_display);
+    state->text_font = NULL;
+    state->text_display = NULL;
 }
 
-int awesomewm_screenlock_run(const char *pam_service, const char *user)
+int awesomewm_screenlock_run_with_options(
+    const char *pam_service,
+    const char *user,
+    const struct awesomewm_screenlock_options *options
+)
 {
     struct lock_state state = { 0 };
     int screen_number;
@@ -694,6 +915,13 @@ int awesomewm_screenlock_run(const char *pam_service, const char *user)
 
     state.pam_service = pam_service == NULL ? "login" : pam_service;
     state.user = user == NULL ? getenv("USER") : user;
+    state.control.listener = -1;
+    state.control.client = -1;
+    state.lockdown_enabled = options == NULL || options->lockdown_enabled;
+    if (options != NULL) {
+        state.wibar_windows = options->wibar_windows;
+        state.wibar_window_count = options->wibar_window_count;
+    }
     if (state.user == NULL || state.user[0] == '\0')
         return 2;
     sigemptyset(&action.sa_mask);
@@ -710,7 +938,10 @@ int awesomewm_screenlock_run(const char *pam_service, const char *user)
     state.screen = iterator.data;
     state.key_symbols = xcb_key_symbols_alloc(state.connection);
     if (state.screen == NULL || state.key_symbols == NULL
+        || (options != NULL && options->control_socket != NULL
+            && !screenlock_control_open(&state.control, options->control_socket))
         || !discover_display_layout(&state)
+        || !prepare_text_renderer(&state)
         || !prepare_background_storage(&state)
         || !start_capture_worker(&state)
         || !finish_capture_before_lock(&state)
@@ -726,6 +957,13 @@ int awesomewm_screenlock_run(const char *pam_service, const char *user)
     draw(&state);
 
     while (!interrupted) {
+        struct screenlock_control_notification notification;
+
+        screenlock_control_poll(&state.control, &notification);
+        if (notification.text[0] != '\0') {
+            apply_notification(&state, &notification);
+            draw(&state);
+        }
         xcb_generic_event_t *event = xcb_poll_for_event(state.connection);
         uint8_t response_type;
         if (event == NULL) {
@@ -742,6 +980,8 @@ int awesomewm_screenlock_run(const char *pam_service, const char *user)
             xcb_keysym_t key = xcb_key_symbols_get_keysym(
                 state.key_symbols, key_event->detail, 0
             );
+
+            reset_status_message(&state);
 
             if (key == XK_BackSpace) {
                 if (state.password_length > 0) {
@@ -762,7 +1002,11 @@ int awesomewm_screenlock_run(const char *pam_service, const char *user)
                 }
                 clear_secret(state.password, state.password_length);
                 state.password_length = 0;
-                state.failure_ticks = FAILURE_DISPLAY_TICKS;
+                snprintf(
+                    state.status_message, sizeof(state.status_message),
+                    "Authentication failed"
+                );
+                state.prompt_inverted = !state.prompt_inverted;
             } else if (state.password_length < PASSWORD_CAPACITY - 1) {
                 char character = key_to_character(key, key_event->state);
                 if (character != '\0') {
@@ -770,8 +1014,6 @@ int awesomewm_screenlock_run(const char *pam_service, const char *user)
                     state.prompt_inverted = !state.prompt_inverted;
                 }
             }
-            if (state.failure_ticks > 0)
-                state.failure_ticks--;
             draw_prompt(&state);
             xcb_flush(state.connection);
         }
@@ -793,4 +1035,11 @@ error:
     if (state.connection != NULL)
         xcb_disconnect(state.connection);
     return 2;
+}
+
+int awesomewm_screenlock_run(const char *pam_service, const char *user)
+{
+    struct awesomewm_screenlock_options options = { .lockdown_enabled = 1 };
+
+    return awesomewm_screenlock_run_with_options(pam_service, user, &options);
 }

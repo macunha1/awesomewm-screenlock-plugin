@@ -39,6 +39,7 @@
           buildInputs = with pkgs; [
             libxcb
             libx11
+            libxft
             xcbutilkeysyms
             pam
             ffmpeg
@@ -84,6 +85,7 @@
             buildInputs = with pkgs; [
               libxcb
               libx11
+              libxft
               xcbutilkeysyms
               pam
               ffmpeg

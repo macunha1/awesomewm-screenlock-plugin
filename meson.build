@@ -15,6 +15,7 @@ xcb = dependency('xcb')
 xcb_keysyms = dependency('xcb-keysyms')
 xcb_xinerama = dependency('xcb-xinerama')
 x11 = dependency('x11')
+xft = dependency('xft')
 pam = dependency('pam')
 avcodec = dependency('libavcodec')
 avdevice = dependency('libavdevice')
@@ -30,8 +31,9 @@ screenlock = library(
   'awesomewm_screenlock',
   'src/screenlock.c',
   'src/capture.c',
+  'src/control.c',
   include_directories: include_directories('include'),
-  dependencies: [pam, x11, xcb, xcb_keysyms, xcb_xinerama, threads, ffmpeg],
+  dependencies: [pam, x11, xft, xcb, xcb_keysyms, xcb_xinerama, threads, ffmpeg],
   install: true,
 )
 
@@ -39,7 +41,7 @@ helper = executable(
   'awesomewm-screenlock-helper',
   'src/helper.c',
   include_directories: include_directories('include'),
-  dependencies: [pam, x11, xcb, xcb_keysyms, xcb_xinerama, threads, ffmpeg],
+  dependencies: [pam, x11, xft, xcb, xcb_keysyms, xcb_xinerama, threads, ffmpeg],
   link_with: screenlock,
   install_rpath: '$ORIGIN/../lib',
   install: true,
