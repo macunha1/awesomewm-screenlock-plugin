@@ -25,7 +25,13 @@
         pkgs.stdenv.mkDerivation {
           pname = "awesomewm-screenlock-plugin";
           version = "0.1.0";
-          src = self;
+          src = pkgs.lib.cleanSourceWith {
+            src = self;
+            filter = path: type:
+              let name = pkgs.lib.baseNameOf path;
+              in !(type == "directory" && pkgs.lib.hasPrefix "build" name)
+                && name != "result";
+          };
 
           nativeBuildInputs = with pkgs; [
             meson

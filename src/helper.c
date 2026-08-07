@@ -23,20 +23,23 @@ int main(int argc, char **argv)
 
     while (argument < argc) {
         if (strcmp(argv[argument], "--control-socket") == 0 && argument + 1 < argc) {
-            options.control_socket = argv[++argument];
+            options.control_socket = argv[argument + 1];
+            argument += 2;
         } else if (strcmp(argv[argument], "--integrated") == 0) {
             options.lockdown_enabled = 0;
+            argument++;
         } else if (strcmp(argv[argument], "--wibar-window") == 0
                    && argument + 1 < argc
                    && options.wibar_window_count < sizeof(wibar_windows) / sizeof(wibar_windows[0])) {
             char *end = NULL;
-            unsigned long window = strtoul(argv[++argument], &end, 0);
+            unsigned long window = strtoul(argv[argument + 1], &end, 0);
 
-            if (end == argv[argument] || *end != '\0' || window > UINT32_MAX) {
+            if (end == argv[argument + 1] || *end != '\0' || window > UINT32_MAX) {
                 usage(argv[0]);
                 return 64;
             }
             wibar_windows[options.wibar_window_count++] = (uint32_t)window;
+            argument += 2;
         } else {
             usage(argv[0]);
             return 64;

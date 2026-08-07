@@ -7,6 +7,7 @@
 #include <security/pam_appl.h>
 #include <xcb/xcb.h>
 #include <xcb/xcb_keysyms.h>
+#include <xcb/randr.h>
 #include <xcb/xinerama.h>
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
@@ -65,6 +66,8 @@ struct lock_state {
     int lockdown_enabled;
     const uint32_t *wibar_windows;
     size_t wibar_window_count;
+    uint16_t lock_width;
+    uint16_t lock_height;
     struct screenlock_control control;
     char notification_level[16];
     char notification_title[128];
@@ -293,7 +296,7 @@ static void draw_background_rows(
             XCB_IMAGE_FORMAT_Z_PIXMAP,
             state->window,
             state->graphics,
-            state->screen->width_in_pixels,
+            state->lock_width,
             rows,
             0,
             (int16_t)y,
@@ -392,11 +395,37 @@ static int use_root_display_layout(struct lock_state *state)
     if (state->displays == NULL)
         return 0;
     state->displays[0] = (struct lock_display){
-        .width = state->screen->width_in_pixels,
-        .height = state->screen->height_in_pixels,
+        .width = state->lock_width,
+        .height = state->lock_height,
     };
     state->display_count = 1;
     return 1;
+}
+
+/*
+ * Extend one root-axis dimension with a display rectangle.
+ *
+ * Contract: `extent` contains the current non-negative root dimension and
+ * `origin` is an X11 RandR/Xinerama origin. Negative origins are already
+ * covered by the root dimension and must not be converted to unsigned values.
+ * X11 dimensions are 16-bit, so larger calculated extents are capped instead
+ * of wrapping into a small window.
+ */
+static void extend_root_extent(
+    uint16_t *extent,
+    int16_t origin,
+    uint16_t size
+)
+{
+    uint32_t end;
+
+    if (origin < 0)
+        return;
+    end = (uint32_t)origin + size;
+    if (end > UINT16_MAX)
+        end = UINT16_MAX;
+    if (end > *extent)
+        *extent = (uint16_t)end;
 }
 
 /*
@@ -414,6 +443,40 @@ static int discover_display_layout(struct lock_state *state)
     xcb_xinerama_screen_info_t *screens;
     struct lock_display *displays;
     int screen_count;
+
+    state->lock_width = state->screen->width_in_pixels;
+    state->lock_height = state->screen->height_in_pixels;
+
+    xcb_randr_get_screen_resources_current_reply_t *resources =
+        xcb_randr_get_screen_resources_current_reply(
+            state->connection,
+            xcb_randr_get_screen_resources_current(
+                state->connection, state->screen->root
+            ),
+            NULL
+        );
+    if (resources != NULL) {
+        int crtc_count =
+            xcb_randr_get_screen_resources_current_crtcs_length(resources);
+        xcb_randr_crtc_t *crtcs =
+            xcb_randr_get_screen_resources_current_crtcs(resources);
+        for (int index = 0; index < crtc_count; index++) {
+            xcb_randr_get_crtc_info_reply_t *crtc =
+                xcb_randr_get_crtc_info_reply(
+                    state->connection,
+                    xcb_randr_get_crtc_info(
+                        state->connection, crtcs[index], XCB_CURRENT_TIME
+                    ),
+                    NULL
+            );
+            if (crtc != NULL && crtc->mode != XCB_NONE) {
+                extend_root_extent(&state->lock_width, crtc->x, crtc->width);
+                extend_root_extent(&state->lock_height, crtc->y, crtc->height);
+            }
+            free(crtc);
+        }
+        free(resources);
+    }
 
     if (!use_root_display_layout(state))
         return 0;
@@ -448,6 +511,12 @@ static int discover_display_layout(struct lock_state *state)
             .width = screens[index].width,
             .height = screens[index].height,
         };
+        extend_root_extent(
+            &state->lock_width, screens[index].x_org, screens[index].width
+        );
+        extend_root_extent(
+            &state->lock_height, screens[index].y_org, screens[index].height
+        );
     }
     state->displays = displays;
     state->display_count = (size_t)screen_count;
@@ -460,7 +529,7 @@ static uint32_t visual_component(uint8_t value, uint32_t mask);
 static void draw(struct lock_state *state)
 {
     draw_background_rows(
-        state, 0, state->screen->height_in_pixels
+        state, 0, state->lock_height
     );
     draw_prompt(state);
     xcb_flush(state->connection);
@@ -475,28 +544,28 @@ static void *capture_worker(void *opaque)
     int result;
 
     /*
-     * Capture runs away from the XCB event loop. The lock surface is already
-     * mapped when this worker starts, so FFmpeg can take its time without
-     * leaving the desktop visibly unlocked.
+     * Capture runs away from the XCB event loop. The lock surface is mapped
+     * only after this worker finishes, so FFmpeg can take its time without
+     * capturing the lock surface or exposing an unfiltered desktop.
      */
     snprintf(
         resolution, sizeof(resolution), "%ux%u",
-        state->screen->width_in_pixels,
-        state->screen->height_in_pixels
+        state->lock_width,
+        state->lock_height
     );
     result = awesomewm_screenlock_capture(
         display == NULL ? ":0" : display, resolution, &capture
     );
 
-    if (result >= 0 && (capture.width != state->screen->width_in_pixels
-                        || capture.height != state->screen->height_in_pixels)) {
+    if (result >= 0 && (capture.width != state->lock_width
+                        || capture.height != state->lock_height)) {
         fprintf(
             stderr,
             "awesomewm-screenlock: clipping filtered frame from %dx%d to %ux%u\n",
             capture.width,
             capture.height,
-            state->screen->width_in_pixels,
-            state->screen->height_in_pixels
+            state->lock_width,
+            state->lock_height
         );
     }
 
@@ -507,14 +576,14 @@ static void *capture_worker(void *opaque)
          * the acquire load in update_background() then makes that row visible
          * to the renderer without copying the whole frame again.
          */
-        for (int y = 0; y < state->screen->height_in_pixels; y++) {
+        for (int y = 0; y < state->lock_height; y++) {
             uint8_t *source = y < capture.height
                 ? capture.pixels + y * capture.stride
                 : NULL;
             uint32_t *destination = (uint32_t *)
                 (state->background + y * state->background_stride);
 
-            for (int x = 0; x < state->screen->width_in_pixels; x++) {
+            for (int x = 0; x < state->lock_width; x++) {
                 if (source != NULL && x < capture.width) {
                     destination[x] = visual_component(
                         source[x * 3], state->red_mask
@@ -576,7 +645,7 @@ static int finish_capture_before_lock(struct lock_state *state)
     status = atomic_load_explicit(
         &state->capture_status, memory_order_acquire
     );
-    if (status < 0 || rows_ready != state->screen->height_in_pixels)
+    if (status < 0 || rows_ready != state->lock_height)
         return 0;
     state->background_rows_drawn = rows_ready;
     state->background_ready = 1;
@@ -630,10 +699,10 @@ static int prepare_background_storage(struct lock_state *state)
     state->red_mask = visual->red_mask;
     state->green_mask = visual->green_mask;
     state->blue_mask = visual->blue_mask;
-    state->background_stride = state->screen->width_in_pixels * 4;
+    state->background_stride = state->lock_width * 4;
     state->background = calloc(
         (size_t)state->background_stride,
-        state->screen->height_in_pixels
+        state->lock_height
     );
     if (state->background == NULL)
         return 0;
@@ -777,6 +846,88 @@ static void apply_notification(
     );
 }
 
+static int is_integrated_wibar(
+    const struct lock_state *state,
+    xcb_window_t window
+)
+{
+    for (size_t index = 0; index < state->wibar_window_count; index++) {
+        if (state->wibar_windows[index] == window)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Keep the lock above every current root child, while leaving all specified
+ * Awesome wibars above the lock. Querying the complete root tree is important:
+ * menus, notifications, and widget popups are separate windows from their
+ * originating wibar and may be mapped after the lock starts.
+ *
+ * X11 may clear or expose the lock surface while these stacking requests are
+ * processed. The caller must repaint the captured background immediately
+ * afterward; otherwise the underlying desktop can briefly become visible or
+ * the surface can remain black.
+ */
+static void restack_integrated_windows(struct lock_state *state)
+{
+    xcb_window_t topmost_non_wibar = XCB_NONE;
+    xcb_query_tree_reply_t *tree = xcb_query_tree_reply(
+        state->connection,
+        xcb_query_tree(state->connection, state->screen->root),
+        NULL
+    );
+
+    if (tree != NULL) {
+        int child_count = xcb_query_tree_children_length(tree);
+        xcb_window_t *children = xcb_query_tree_children(tree);
+        for (int index = 0; index < child_count; index++) {
+            if (children[index] == state->window
+                || is_integrated_wibar(state, children[index]))
+                continue;
+            /* Query-tree order is bottom-to-top, so retain only the top one. */
+            topmost_non_wibar = children[index];
+        }
+        free(tree);
+    }
+
+    if (topmost_non_wibar != XCB_NONE) {
+        uint32_t stacking[] = {
+            topmost_non_wibar,
+            XCB_STACK_MODE_ABOVE,
+        };
+        xcb_configure_window(
+            state->connection,
+            state->window,
+            XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE,
+            stacking
+        );
+    }
+
+    for (size_t index = 0; index < state->wibar_window_count; index++) {
+        uint32_t stacking[] = { XCB_STACK_MODE_ABOVE };
+        xcb_configure_window(
+            state->connection,
+            state->wibar_windows[index],
+            XCB_CONFIG_WINDOW_STACK_MODE,
+            stacking
+        );
+    }
+
+    if (state->wibar_window_count > 0) {
+        uint32_t stacking[] = {
+            state->wibar_windows[0],
+            XCB_STACK_MODE_BELOW,
+        };
+        xcb_configure_window(
+            state->connection,
+            state->window,
+            XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE,
+            stacking
+        );
+    }
+}
+
 static int create_lock_window(struct lock_state *state)
 {
     uint32_t values[] = {
@@ -797,6 +948,16 @@ static int create_lock_window(struct lock_state *state)
         return 0;
     }
 
+    if (!state->lockdown_enabled) {
+        uint32_t event_mask = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
+        xcb_change_window_attributes(
+            state->connection,
+            state->screen->root,
+            XCB_CW_EVENT_MASK,
+            &event_mask
+        );
+    }
+
     state->window = xcb_generate_id(state->connection);
     xcb_create_window(
         state->connection,
@@ -805,8 +966,8 @@ static int create_lock_window(struct lock_state *state)
         state->screen->root,
         0,
         0,
-        state->screen->width_in_pixels,
-        state->screen->height_in_pixels,
+        state->lock_width,
+        state->lock_height,
         0,
         XCB_WINDOW_CLASS_INPUT_OUTPUT,
         state->screen->root_visual,
@@ -817,17 +978,13 @@ static int create_lock_window(struct lock_state *state)
     state->graphics = xcb_generate_id(state->connection);
     xcb_create_gc(state->connection, state->graphics, state->window, 0, NULL);
     xcb_map_window(state->connection, state->window);
-    if (!state->lockdown_enabled && state->wibar_window_count > 0) {
-        uint32_t stacking[] = {
-            state->wibar_windows[0],
-            XCB_STACK_MODE_BELOW,
-        };
-
-        /* Keep the real Awesome wibar above the native lock surface. */
+    if (!state->lockdown_enabled) {
+        restack_integrated_windows(state);
+    } else {
+        uint32_t lock_stacking[] = { XCB_STACK_MODE_ABOVE };
         xcb_configure_window(
             state->connection, state->window,
-            XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE,
-            stacking
+            XCB_CONFIG_WINDOW_STACK_MODE, lock_stacking
         );
     }
     xcb_set_input_focus(state->connection, XCB_INPUT_FOCUS_PARENT,
@@ -948,12 +1105,7 @@ int awesomewm_screenlock_run_with_options(
         || !create_lock_window(&state))
         goto error;
 
-    /*
-     * x11grab must finish before this window is mapped. Otherwise the capture
-     * would contain this lock surface rather than the desktop it protects.
-     * Once the filtered pixels are ready, mapping and painting the lock are
-     * immediate and the previous desktop never appears on the lock surface.
-     */
+    /* The captured background is ready before either mode becomes visible. */
     draw(&state);
 
     while (!interrupted) {
@@ -973,7 +1125,15 @@ int awesomewm_screenlock_run_with_options(
             continue;
         }
         response_type = event->response_type & 0x7f;
-        if (response_type == XCB_EXPOSE) {
+        if (!state.lockdown_enabled && response_type == XCB_MAP_NOTIFY) {
+            xcb_window_t window = ((xcb_map_notify_event_t *)event)->window;
+            if (window != state.window
+                && !is_integrated_wibar(&state, window)) {
+                restack_integrated_windows(&state);
+                /* Required after X11 restacking; see restack_integrated_windows. */
+                draw(&state);
+            }
+        } else if (response_type == XCB_EXPOSE) {
             draw(&state);
         } else if (response_type == XCB_KEY_PRESS) {
             xcb_key_press_event_t *key_event = (xcb_key_press_event_t *)event;

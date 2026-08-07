@@ -95,6 +95,19 @@ registry; arbitrary Awesome widget callbacks cannot be inferred safely from
 X11 window IDs. Until those widgets are explicitly registered, an empty list
 means all integrated actions are allowed.
 
+Integrated mode also has an unavoidable X11 stacking/redraw side effect. A
+wibar menu, notification, or widget popup is a separate top-level X11 window
+and may be mapped after the lock surface. The native helper therefore watches
+root-level map events, places the lock above the topmost non-wibar window, and
+then restacks all configured wibars above it. This keeps the number of stacking
+requests bounded even when many client windows exist. X11 may clear or expose
+the native surface while that stacking change is processed, so the helper
+immediately repaints the complete captured background after every restack.
+Without that redraw, the compositor can briefly show the underlying desktop or
+leave a black region. This repaint is required behavior, not an optional
+optimization; integrated mode should not be treated as a flicker-free security
+boundary.
+
 The helper also accepts bounded MessagePack notification messages through the
 private control socket configured by `controlSocket`:
 
