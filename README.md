@@ -171,6 +171,13 @@ every active display. The message uses the same foreground color as that
 prompt state. The next key press clears the message and restores the default
 prompt colors before accepting the next password.
 
+The prompt accepts only as many characters as its visible dot grid can render
+(24 columns by 3 rows). Extra key presses are ignored rather than drawing
+outside the input box. Each submission creates a fresh PAM transaction. If PAM
+reports a transient service or module failure, the helper waits briefly and
+recreates that transaction once; ordinary wrong-password results are not
+retried.
+
 The helper starts a native capture worker, waits for its filtered frame, and
 only then maps the lock surface. FFmpeg applies the privacy filter:
 

@@ -24,7 +24,23 @@
 #include <unistd.h>
 
 enum {
-    PASSWORD_CAPACITY = 256,
+    PROMPT_WIDTH = 320,
+    PROMPT_HEIGHT = 72,
+    PROMPT_DOT_SIZE = 7,
+    PROMPT_DOT_HORIZONTAL_STEP = 12,
+    PROMPT_DOT_VERTICAL_STEP = 16,
+    PROMPT_DOT_LEFT = 18,
+    PROMPT_DOT_TOP = 18,
+    PROMPT_DOT_COLUMNS =
+        (PROMPT_WIDTH - PROMPT_DOT_LEFT - PROMPT_DOT_SIZE)
+        / PROMPT_DOT_HORIZONTAL_STEP + 1,
+    PROMPT_DOT_ROWS =
+        (PROMPT_HEIGHT - PROMPT_DOT_TOP - PROMPT_DOT_SIZE)
+        / PROMPT_DOT_VERTICAL_STEP + 1,
+    /* One extra byte is reserved for the NUL terminator. */
+    PASSWORD_CAPACITY = PROMPT_DOT_COLUMNS * PROMPT_DOT_ROWS + 1,
+    PAM_RETRY_COUNT = 1,
+    PAM_RETRY_DELAY_US = 100000,
 };
 
 struct lock_display {
@@ -142,6 +158,30 @@ error:
     }
     free(result);
     return PAM_CONV_ERR;
+}
+
+/*
+ * Identify PAM failures that may be caused by a stale or restarting PAM
+ * module after a system or kernel transition.
+ *
+ * Contract: this function receives the result returned by one complete PAM
+ * transaction. It must never classify PAM_AUTH_ERR as retryable: a wrong
+ * password is a user failure, not an infrastructure failure.
+ */
+static int pam_result_is_retryable(int result)
+{
+    switch (result) {
+    case PAM_ABORT:
+    case PAM_AUTHINFO_UNAVAIL:
+    case PAM_MODULE_UNKNOWN:
+    case PAM_OPEN_ERR:
+    case PAM_SERVICE_ERR:
+    case PAM_SYSTEM_ERR:
+    case PAM_TRY_AGAIN:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 static void draw_rect(
@@ -265,8 +305,8 @@ static void prompt_geometry(
 
     (void)state;
 
-    *width = 320;
-    *height = 72;
+    *width = PROMPT_WIDTH;
+    *height = PROMPT_HEIGHT;
     *left = center_x - (int16_t)(*width / 2);
     *top = center_y - (int16_t)(*height / 2);
 }
@@ -345,9 +385,16 @@ static void draw_prompt_on_display(
         );
     else
         for (size_t index = 0; index < state->password_length; index++) {
-            int16_t dot_x = left + 18 + (int16_t)(index % 24) * 12;
-            int16_t dot_y = top + 18 + (int16_t)(index / 24) * 16;
-            draw_rect(state, dot_x, dot_y, 7, 7, prompt_foreground);
+            int16_t dot_x = left + PROMPT_DOT_LEFT
+                + (int16_t)(index % PROMPT_DOT_COLUMNS)
+                * PROMPT_DOT_HORIZONTAL_STEP;
+            int16_t dot_y = top + PROMPT_DOT_TOP
+                + (int16_t)(index / PROMPT_DOT_COLUMNS)
+                * PROMPT_DOT_VERTICAL_STEP;
+            draw_rect(
+                state, dot_x, dot_y,
+                PROMPT_DOT_SIZE, PROMPT_DOT_SIZE, prompt_foreground
+            );
         }
 
     if (state->notification_text[0] != '\0') {
@@ -760,7 +807,14 @@ static char key_to_character(xcb_keysym_t key, uint16_t key_state)
     return '\0';
 }
 
-static int authenticate(struct lock_state *state)
+/*
+ * Execute one complete PAM transaction and always release its handle.
+ *
+ * Contract: `state->password` and `state->user` are valid for the duration of
+ * this call. A new handle is created for every call, which is important after
+ * a PAM module or its backing authentication agent has been restarted.
+ */
+static int authenticate_once(struct lock_state *state)
 {
     struct pam_data pam_data = { state->password, state->user };
     struct pam_conv conversation = { pam_conversation, &pam_data };
@@ -770,12 +824,43 @@ static int authenticate(struct lock_state *state)
         result = pam_authenticate(state->pam, 0);
     if (result == PAM_SUCCESS)
         result = pam_acct_mgmt(state->pam, 0);
-    if (result != PAM_SUCCESS)
-        fprintf(stderr, "awesomewm-screenlock: PAM authentication failed for %s: %s\n",
-                state->user, pam_strerror(state->pam, result));
+    if (result != PAM_SUCCESS) {
+        const char *error = state->pam == NULL
+            ? "PAM transaction could not be created"
+            : pam_strerror(state->pam, result);
+
+        fprintf(
+            stderr,
+            "awesomewm-screenlock: PAM authentication failed for %s: %s\n",
+            state->user, error
+        );
+    }
     if (state->pam != NULL)
         pam_end(state->pam, result);
     state->pam = NULL;
+    return result;
+}
+
+/*
+ * Authenticate with one bounded recovery attempt for transient PAM failures.
+ *
+ * The retry deliberately rebuilds the PAM transaction instead of reusing a
+ * possibly stale handle. It does not retry ordinary credential failures, so a
+ * wrong password produces exactly one PAM attempt and one visible error.
+ */
+static int authenticate(struct lock_state *state)
+{
+    int result = authenticate_once(state);
+
+    for (int attempt = 0; attempt < PAM_RETRY_COUNT
+         && pam_result_is_retryable(result); attempt++) {
+        fprintf(
+            stderr,
+            "awesomewm-screenlock: retrying PAM transaction after transient failure\n"
+        );
+        usleep(PAM_RETRY_DELAY_US);
+        result = authenticate_once(state);
+    }
     return result == PAM_SUCCESS;
 }
 
