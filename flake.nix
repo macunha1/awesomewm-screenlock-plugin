@@ -11,59 +11,25 @@
         "aarch64-linux"
       ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
+      nixosModule = import ./build/nix/nixos-module.nix { inherit self; };
 
-      packageFor = system:
+      packageFor =
+        system:
         let
           pkgs = import nixpkgs { inherit system; };
-          ffmpeg = pkgs.ffmpeg.override {
-            withXcb = true;
-            withXcbShm = true;
-            withXcbShape = true;
-            withXcbxfixes = true;
-          };
         in
-        pkgs.stdenv.mkDerivation {
-          pname = "awesomewm-screenlock-plugin";
-          version = "0.1.0";
-          src = pkgs.lib.cleanSourceWith {
-            src = self;
-            filter = path: type:
-              let name = pkgs.lib.baseNameOf path;
-              in !(type == "directory" && pkgs.lib.hasPrefix "build" name)
-                && name != "result";
-          };
-
-          nativeBuildInputs = with pkgs; [
-            meson
-            ninja
-            pkg-config
-            luajit
-          ];
-
-          mesonFlags = [ "-Dlua-version=5.1" ];
-
-          buildInputs = with pkgs; [
-            libxcb
-            libx11
-            libxft
-            xcbutilkeysyms
-            pam
-            ffmpeg
-          ];
-
-          passthru.luaModulePaths = [ "share/lua/5.1" ];
-          passthru.luaModule = "share/lua/5.1";
-
-          meta = {
-            description = "AwesomeWM screenlock plugin with a Lua API and XCB/PAM helper";
-            homepage = "https://github.com/macunha1/awesomewm-screenlock-plugin";
-            license = pkgs.lib.licenses.mit;
-            platforms = pkgs.lib.platforms.linux;
-            mainProgram = "awesomewm-screenlock-helper";
-          };
-        };
+        pkgs.callPackage ./build/nix/package.nix { src = self; };
     in
     {
+      overlays.default = final: _previous: {
+        awesomewm-screenlock-plugin = final.callPackage ./build/nix/package.nix { src = self; };
+      };
+
+      nixosModules = {
+        default = nixosModule;
+        awesomewm-screenlock = nixosModule;
+      };
+
       packages = forEachSystem (system: {
         default = packageFor system;
         awesomewm-screenlock-plugin = packageFor system;
@@ -100,8 +66,33 @@
         }
       );
 
-      checks = forEachSystem (system: {
-        build = packageFor system;
-      });
+      checks = forEachSystem (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          package = packageFor system;
+          nixosConfiguration = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              nixosModule
+              {
+                services.xserver.windowManager.awesome.enable = true;
+                services.awesomewm-screenlock.enable = true;
+                system.stateVersion = "26.05";
+              }
+            ];
+          };
+        in
+        {
+          build = package;
+          nixos-module =
+            nixpkgs.lib.findFirst (check: check.name == "awesomewm-screenlock-pam-compatibility")
+              (throw "NixOS module did not add the PAM compatibility check")
+              nixosConfiguration.config.system.checks;
+          pam-compatibility = import ./build/nix/pam-compatibility-check.nix {
+            inherit package pkgs;
+          };
+        }
+      );
     };
 }

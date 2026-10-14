@@ -130,9 +130,9 @@ install the dependencies and then wire it into AwesomeWM's `rc.lua`.
 ## Build
 
 ```sh
-meson setup build
-meson compile -C build
-meson test -C build
+meson setup build/output
+meson compile -C build/output
+meson test -C build/output
 ```
 
 Nix users can build the package or development shell:
@@ -142,21 +142,39 @@ nix build
 nix develop
 ```
 
-The flake package contains both the helper binary and the Lua module, so a
-configuration flake can expose one package to AwesomeWM:
+For NixOS, prefer the included module. It builds the plugin from the host's
+`pkgs`, enables the `xlock` PAM service, installs the helper and Lua module, and
+adds an ELF compatibility check to `system.checks`:
 
 ```nix
-inputs.awesomewm-screenlock-plugin.url =
-  "github:macunha1/awesomewm-screenlock-plugin";
+imports = [ inputs.awesomewm-screenlock-plugin.nixosModules.default ];
 
-let
-  screenlock = inputs.awesomewm-screenlock-plugin.packages.${pkgs.system}.default;
-in
-{
-  environment.systemPackages = [ screenlock ];
-  services.xserver.windowManager.awesome.luaModules = [ screenlock ];
-}
+services.xserver.windowManager.awesome.enable = true;
+services.awesomewm-screenlock.enable = true;
 ```
+
+The module fails evaluation when a custom package does not use the host libc
+and PAM package. The build-time check also verifies the installed helper's ELF
+interpreter and the library's runtime paths before a NixOS generation can be
+activated. Add `require("awesomewm_screenlock")` to `rc.lua` as shown above;
+the module does not modify the user's AwesomeWM configuration.
+
+If a configuration consumes `packages.<system>.default` directly instead of
+the NixOS module or overlay, make the plugin follow the configuration's
+`nixpkgs` input:
+
+```nix
+inputs.awesomewm-screenlock-plugin = {
+  url = "github:macunha1/awesomewm-screenlock-plugin";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+This is required because PAM loads host modules into the helper process. A
+helper built with a different libc or PAM package can lock successfully but be
+unable to authenticate, leaving reboot as the only recovery path. The flake
+also exports `overlays.default` for consumers that want the package built from
+their own package set without using the NixOS module.
 
 ## Design
 
