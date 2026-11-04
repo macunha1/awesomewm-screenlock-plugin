@@ -1,0 +1,23 @@
+name: Setup
+description: Install Nix and restore the locked development environment
+
+runs:
+  using: composite
+  steps:
+    - name: Install Nix
+      uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      with:
+        install_url: https://releases.nixos.org/nix/nix-2.34.9/install
+        extra_nix_config: |
+          experimental-features = nix-command flakes
+          accept-flake-config = true
+
+    - name: Restore and save Nix store
+      uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+      with:
+        primary-key: >-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup/action.yml') }}-${{
+          hashFiles('flake.lock', 'flake.nix', 'devenv.nix', 'nix/**/*.nix', 'build/**/*.nix') }}
+        restore-prefixes-first-match: >-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup/action.yml') }}-
+        gc-max-store-size-linux: 4G

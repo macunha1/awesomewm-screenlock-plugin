@@ -1,6 +1,7 @@
 #include "awesomewm_screenlock_capture.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +21,6 @@ struct capture_context {
     AVPacket *packet;
     AVFrame *decoded;
     AVFrame *filtered;
-    AVFrame *rgb;
     AVFilterGraph *filter_graph;
     AVFilterContext *filter_source;
     AVFilterContext *filter_sink;
@@ -58,7 +58,6 @@ static void capture_context_cleanup(struct capture_context *context)
     avfilter_inout_free(&context->filter_inputs);
     avfilter_inout_free(&context->filter_outputs);
     avfilter_graph_free(&context->filter_graph);
-    av_frame_free(&context->rgb);
     av_frame_free(&context->filtered);
     av_frame_free(&context->decoded);
     av_packet_free(&context->packet);
@@ -174,9 +173,8 @@ static int capture_prepare_filter(struct capture_context *context)
     context->packet = av_packet_alloc();
     context->decoded = av_frame_alloc();
     context->filtered = av_frame_alloc();
-    context->rgb = av_frame_alloc();
     if (context->packet == NULL || context->decoded == NULL
-        || context->filtered == NULL || context->rgb == NULL)
+        || context->filtered == NULL)
         return AVERROR(ENOMEM);
 
     context->filter_graph = avfilter_graph_alloc();
@@ -235,14 +233,22 @@ static int capture_copy_rgb(
     struct screenlock_capture *capture
 )
 {
-    int result;
+    uint8_t *planes[4] = { NULL };
+    int strides[4] = { 0 };
+    int rows;
 
-    context->rgb->format = AV_PIX_FMT_RGB24;
-    context->rgb->width = context->filtered->width;
-    context->rgb->height = context->filtered->height;
-    result = av_frame_get_buffer(context->rgb, 1);
-    if (result < 0)
-        return result;
+    capture->width = context->filtered->width;
+    capture->height = context->filtered->height;
+    if (capture->width <= 0 || capture->height <= 0 || capture->width > INT_MAX / 3)
+        return AVERROR(EINVAL);
+    capture->stride = capture->width * 3;
+    if ((size_t)capture->height > SIZE_MAX / (size_t)capture->stride)
+        return AVERROR(ENOMEM);
+    capture->pixels = malloc((size_t)capture->stride * (size_t)capture->height);
+    if (capture->pixels == NULL)
+        return AVERROR(ENOMEM);
+    planes[0] = capture->pixels;
+    strides[0] = capture->stride;
     context->scaler = sws_getContext(
         context->filtered->width, context->filtered->height,
         context->filtered->format, context->filtered->width,
@@ -251,27 +257,13 @@ static int capture_copy_rgb(
     );
     if (context->scaler == NULL)
         return AVERROR(EINVAL);
-    sws_scale(
+    rows = sws_scale(
         context->scaler, (const uint8_t *const *)context->filtered->data,
         context->filtered->linesize, 0, context->filtered->height,
-        context->rgb->data, context->rgb->linesize
+        planes, strides
     );
 
-    capture->width = context->rgb->width;
-    capture->height = context->rgb->height;
-    capture->stride = context->rgb->linesize[0];
-    capture->pixels = malloc(
-        (size_t)capture->stride * (size_t)capture->height
-    );
-    if (capture->pixels == NULL)
-        return AVERROR(ENOMEM);
-    for (int row = 0; row < capture->height; row++)
-        memcpy(
-            capture->pixels + row * capture->stride,
-            context->rgb->data[0] + row * context->rgb->linesize[0],
-            (size_t)capture->stride
-        );
-    return 0;
+    return rows == capture->height ? 0 : AVERROR(EIO);
 }
 
 /*

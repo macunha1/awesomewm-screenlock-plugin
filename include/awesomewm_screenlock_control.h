@@ -19,7 +19,6 @@ struct screenlock_control {
     char path[108];
     unsigned char frame[8192];
     size_t frame_length;
-    size_t frame_expected;
 };
 
 int screenlock_control_open(struct screenlock_control *control, const char *path);

@@ -1,0 +1,59 @@
+name: Validate and publish screenlock
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screenlock-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Validate, package, and install the artifact
+        run: >-
+          nix develop --profile "${RUNNER_TEMP}/nix-devenv" --impure --no-update-lock-file
+          --command devenv tasks run app:ci
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: luarocks-source
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: ci
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: luarocks
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: luarocks-source
+          path: dist/
+      - name: Publish the verified source rock
+        env:
+          LUAROCKS_API_KEY: ${{ secrets.LUAROCKS_API_KEY }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          nix develop --profile "${RUNNER_TEMP}/nix-devenv" --impure --no-update-lock-file
+          --command devenv tasks run app:publish

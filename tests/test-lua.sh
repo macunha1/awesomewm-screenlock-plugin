@@ -3,17 +3,24 @@ set -eu
 
 lua_bin=${1:?Lua interpreter required}
 source_dir=${2:?source directory required}
+module_dir=${3:-$source_dir/lua}
 
-LUA_PATH="$source_dir/lua/?.lua;$source_dir/lua/?/init.lua;;" \
+LUA_PATH="$module_dir/?.lua;$module_dir/?/init.lua;;" \
     "$lua_bin" - <<'LUA'
 local calls = {}
+local pending_callback
+local defer_exit = false
 
 package.preload.awful = function()
     return {
         spawn = {
             easy_async = function(command, callback)
                 calls[#calls + 1] = command
-                callback("", "", "exit", 0)
+                if defer_exit then
+                    pending_callback = callback
+                else
+                    callback("", "", "exit", 0)
+                end
             end,
         },
     }
@@ -37,4 +44,20 @@ assert(calls[3][1] == "test-helper")
 assert(calls[3][2] == "--integrated")
 assert(calls[3][3] == "--wibar-window")
 assert(calls[3][4] == "1234")
+
+-- Keep one helper active until its asynchronous exit callback arrives.
+defer_exit = true
+screenlock:lock()
+assert(screenlock.active == true)
+screenlock:lock()
+assert(#calls == 4)
+assert(screenlock:notify("title", "text") == false)
+pending_callback("", "", "exit", 0)
+assert(screenlock.active == false)
+assert(screenlock:notify("title", "text") == false)
+defer_exit = false
+
+-- Existing Awesome configurations keep the compatibility entry point.
+require("plugins.screenlock").lock()
+assert(calls[5][1] == "awesomewm-screenlock-helper")
 LUA

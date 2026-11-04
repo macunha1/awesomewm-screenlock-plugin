@@ -24,7 +24,6 @@ avfilter = dependency('libavfilter')
 avformat = dependency('libavformat')
 avutil = dependency('libavutil')
 swscale = dependency('libswscale')
-threads = dependency('threads')
 
 ffmpeg = [avcodec, avdevice, avfilter, avformat, avutil, swscale]
 
@@ -34,7 +33,7 @@ screenlock = library(
   'src/capture.c',
   'src/control.c',
   include_directories: include_directories('include'),
-  dependencies: [pam, x11, xft, xcb, xcb_keysyms, xcb_xinerama, xcb_randr, threads, ffmpeg],
+  dependencies: [pam, x11, xft, xcb, xcb_keysyms, xcb_xinerama, xcb_randr, ffmpeg],
   install: true,
 )
 
@@ -42,7 +41,7 @@ helper = executable(
   'awesomewm-screenlock-helper',
   'src/helper.c',
   include_directories: include_directories('include'),
-  dependencies: [pam, x11, xft, xcb, xcb_keysyms, xcb_xinerama, xcb_randr, threads, ffmpeg],
+  dependencies: [pam, x11, xft, xcb, xcb_keysyms, xcb_xinerama, xcb_randr, ffmpeg],
   link_with: screenlock,
   install_rpath: '$ORIGIN/../lib',
   install: true,
@@ -54,6 +53,29 @@ test('helper usage', test_helper, args: [helper])
 lua = find_program('luajit', 'lua', required: true)
 test_lua = find_program('tests/test-lua.sh')
 test('Lua module', test_lua, args: [lua, meson.project_source_root()])
+
+control_test = executable(
+  'test-control',
+  'tests/test-control.c',
+  'src/control.c',
+  include_directories: include_directories('include'),
+  c_args: ['-UNDEBUG'],
+)
+test('control socket', control_test)
+
+xvfb = find_program('Xvfb', required: false)
+if xvfb.found()
+  python = find_program('python3')
+  test(
+    'isolated X11 lock',
+    python,
+    args: [
+      files('tests/test-display.py'), helper, xvfb.full_path(),
+      x11.get_variable(pkgconfig: 'libdir') / 'libX11.so', meson.project_source_root(),
+    ],
+    timeout: 30,
+  )
+endif
 
 install_headers('include/awesomewm_screenlock.h')
 install_subdir(

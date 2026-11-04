@@ -14,7 +14,7 @@
 
 enum {
     CONTROL_FRAME_HEADER_SIZE = 4,
-    CONTROL_MAX_PAYLOAD = sizeof(((struct screenlock_control *)0)->frame)
+    CONTROL_MAX_PAYLOAD = sizeof(((struct screenlock_control *)0)->frame) - CONTROL_FRAME_HEADER_SIZE
 };
 
 struct message_cursor {
@@ -27,8 +27,12 @@ static void copy_text(char *destination, size_t capacity, const char *source)
 {
     if (capacity == 0)
         return;
-    strncpy(destination, source, capacity - 1);
-    destination[capacity - 1] = '\0';
+    size_t length = strlen(source);
+
+    if (length >= capacity)
+        length = capacity - 1;
+    memcpy(destination, source, length);
+    destination[length] = '\0';
 }
 
 static int set_nonblocking(int descriptor)
@@ -165,24 +169,26 @@ static int consume_frame(
         || control->frame_length < CONTROL_FRAME_HEADER_SIZE + payload_length) {
         if (payload_length < 1 || payload_length > CONTROL_MAX_PAYLOAD) {
             control->frame_length = 0;
-            control->frame_expected = 0;
             return 1;
         }
         return 0;
     }
-    if (control->frame[CONTROL_FRAME_HEADER_SIZE] == SCREENLOCK_CONTROL_NOTIFICATION)
-        decode_notification(
+    if (control->frame[CONTROL_FRAME_HEADER_SIZE] == SCREENLOCK_CONTROL_NOTIFICATION) {
+        struct screenlock_control_notification decoded;
+
+        if (decode_notification(
             control->frame + CONTROL_FRAME_HEADER_SIZE + 1,
             payload_length - 1,
-            notification
-        );
+            &decoded
+        ))
+            *notification = decoded;
+    }
     memmove(
         control->frame,
         control->frame + CONTROL_FRAME_HEADER_SIZE + payload_length,
         control->frame_length - CONTROL_FRAME_HEADER_SIZE - payload_length
     );
     control->frame_length -= CONTROL_FRAME_HEADER_SIZE + payload_length;
-    control->frame_expected = 0;
     return 1;
 }
 
@@ -193,8 +199,10 @@ int screenlock_control_open(struct screenlock_control *control, const char *path
     memset(control, 0, sizeof(*control));
     control->listener = -1;
     control->client = -1;
-    if (path == NULL || strlen(path) >= sizeof(address.sun_path))
+    if (path == NULL)
         return 1;
+    if (strlen(path) >= sizeof(address.sun_path))
+        return 0;
     snprintf(control->path, sizeof(control->path), "%s", path);
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
     unlink(path);
@@ -236,7 +244,7 @@ void screenlock_control_poll(
         control->frame + control->frame_length,
         sizeof(control->frame) - control->frame_length
     );
-    if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+    if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
         close(control->client);
         control->client = -1;
         control->frame_length = 0;

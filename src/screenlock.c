@@ -14,8 +14,8 @@
 #include <X11/Xft/Xft.h>
 
 #include <signal.h>
-#include <stdatomic.h>
-#include <pthread.h>
+#include <errno.h>
+#include <poll.h>
 #include <pwd.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -65,18 +65,11 @@ struct lock_state {
     char status_message[64];
     Display *text_display;
     XftFont *text_font;
-    struct screenlock_capture capture;
     uint8_t *background;
     int background_stride;
     uint32_t red_mask;
     uint32_t green_mask;
     uint32_t blue_mask;
-    int background_rows_drawn;
-    atomic_int background_rows_ready;
-    atomic_int capture_status;
-    pthread_t capture_thread;
-    int capture_thread_started;
-    int background_ready;
     struct lock_display *displays;
     size_t display_count;
     int lockdown_enabled;
@@ -101,6 +94,34 @@ static void handle_signal(int signal_number)
 {
     (void)signal_number;
     interrupted = 1;
+}
+
+static int wait_for_activity(struct lock_state *state)
+{
+    struct pollfd descriptors[] = {
+        { .fd = xcb_get_file_descriptor(state->connection), .events = POLLIN },
+        { .fd = state->control.client >= 0 ? state->control.client : state->control.listener,
+          .events = POLLIN },
+    };
+    sigset_t blocked;
+    sigset_t previous;
+    int result = 0;
+
+    /* Check the flag with termination signals blocked, then atomically restore
+     * the mask while waiting. A signal between the event check and ppoll must
+     * not leave the helper asleep indefinitely. */
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGINT);
+    sigaddset(&blocked, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous) < 0)
+        return 0;
+    if (!interrupted) {
+        result = ppoll(descriptors, 2, NULL, &previous);
+        if (result < 0 && errno == EINTR)
+            result = 0;
+    }
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    return result >= 0;
 }
 
 static void clear_secret(char *secret, size_t length)
@@ -320,8 +341,7 @@ static void draw_background_rows(
     /*
      * X11 limits the size of one PutImage request. Send a few rows at a time
      * so a 1080p or 4K background cannot invalidate the X connection before
-     * the password surface is drawn. The worker publishes completed rows and
-     * this X11 thread consumes them in order. These requests are deliberately
+     * the password surface is drawn. These requests are deliberately
      * queued without a per-tile check: checking each tile synchronously would
      * turn the safe tiling into hundreds of X11 round trips and recreate the
      * delay this path is intended to avoid.
@@ -582,18 +602,16 @@ static void draw(struct lock_state *state)
     xcb_flush(state->connection);
 }
 
-static void *capture_worker(void *opaque)
+static int prepare_background(struct lock_state *state)
 {
-    struct lock_state *state = opaque;
     struct screenlock_capture capture = { 0 };
     char resolution[32];
     const char *display = getenv("DISPLAY");
     int result;
 
     /*
-     * Capture runs away from the XCB event loop. The lock surface is mapped
-     * only after this worker finishes, so FFmpeg can take its time without
-     * capturing the lock surface or exposing an unfiltered desktop.
+     * Capture must finish before mapping the lock surface so x11grab sees
+     * the desktop rather than the locker's own window.
      */
     snprintf(
         resolution, sizeof(resolution), "%ux%u",
@@ -617,12 +635,6 @@ static void *capture_worker(void *opaque)
     }
 
     if (result >= 0) {
-        /*
-         * XCB must stay on the owner thread, but pixel conversion does not.
-         * Publish each completed row only after all of its pixels are written;
-         * the acquire load in update_background() then makes that row visible
-         * to the renderer without copying the whole frame again.
-         */
         for (int y = 0; y < state->lock_height; y++) {
             uint8_t *source = y < capture.height
                 ? capture.pixels + y * capture.stride
@@ -643,60 +655,10 @@ static void *capture_worker(void *opaque)
                     destination[x] = state->screen->black_pixel;
                 }
             }
-            atomic_store_explicit(
-                &state->background_rows_ready, y + 1, memory_order_release
-            );
         }
     }
     awesomewm_screenlock_capture_free(&capture);
-    atomic_store_explicit(
-        &state->capture_status, result < 0 ? -1 : 1, memory_order_release
-    );
-    return NULL;
-}
-
-static int start_capture_worker(struct lock_state *state)
-{
-    atomic_init(&state->background_rows_ready, 0);
-    atomic_init(&state->capture_status, 0);
-    if (pthread_create(&state->capture_thread, NULL, capture_worker, state) != 0)
-        return 0;
-    state->capture_thread_started = 1;
-    return 1;
-}
-
-static void stop_capture_worker(struct lock_state *state)
-{
-    if (state->capture_thread_started)
-        pthread_join(state->capture_thread, NULL);
-    state->capture_thread_started = 0;
-}
-
-static int finish_capture_before_lock(struct lock_state *state)
-{
-    int rows_ready;
-    int status;
-
-    /*
-     * x11grab captures the composited desktop. Waiting here is intentional:
-     * mapping the lock window first would make the capture contain the
-     * locker's own black surface instead of the desktop being protected.
-     */
-    if (state->capture_thread_started) {
-        pthread_join(state->capture_thread, NULL);
-        state->capture_thread_started = 0;
-    }
-    rows_ready = atomic_load_explicit(
-        &state->background_rows_ready, memory_order_acquire
-    );
-    status = atomic_load_explicit(
-        &state->capture_status, memory_order_acquire
-    );
-    if (status < 0 || rows_ready != state->lock_height)
-        return 0;
-    state->background_rows_drawn = rows_ready;
-    state->background_ready = 1;
-    return 1;
+    return result >= 0;
 }
 
 static unsigned mask_shift(uint32_t mask)
@@ -1135,7 +1097,6 @@ static void destroy_lock_window(struct lock_state *state)
     xcb_flush(state->connection);
     free(state->background);
     state->background = NULL;
-    awesomewm_screenlock_capture_free(&state->capture);
     if (state->text_font != NULL)
         XftFontClose(state->text_display, state->text_font);
     if (state->text_display != NULL)
@@ -1185,8 +1146,7 @@ int awesomewm_screenlock_run_with_options(
         || !discover_display_layout(&state)
         || !prepare_text_renderer(&state)
         || !prepare_background_storage(&state)
-        || !start_capture_worker(&state)
-        || !finish_capture_before_lock(&state)
+        || !prepare_background(&state)
         || !create_lock_window(&state))
         goto error;
 
@@ -1206,7 +1166,8 @@ int awesomewm_screenlock_run_with_options(
         if (event == NULL) {
             if (xcb_connection_has_error(state.connection) != 0)
                 break;
-            usleep(10000);
+            if (!wait_for_activity(&state))
+                break;
             continue;
         }
         response_type = event->response_type & 0x7f;
@@ -1239,7 +1200,6 @@ int awesomewm_screenlock_run_with_options(
             } else if (key == XK_Return || key == XK_KP_Enter) {
                 if (authenticate(&state)) {
                     free(event);
-                    stop_capture_worker(&state);
                     destroy_lock_window(&state);
                     xcb_key_symbols_free(state.key_symbols);
                     xcb_disconnect(state.connection);
@@ -1266,14 +1226,12 @@ int awesomewm_screenlock_run_with_options(
     }
 
     clear_secret(state.password, state.password_length);
-    stop_capture_worker(&state);
     destroy_lock_window(&state);
     xcb_key_symbols_free(state.key_symbols);
     xcb_disconnect(state.connection);
     return 1;
 
 error:
-    stop_capture_worker(&state);
     if (state.key_symbols != NULL)
         xcb_key_symbols_free(state.key_symbols);
     destroy_lock_window(&state);

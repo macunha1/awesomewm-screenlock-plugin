@@ -139,8 +139,16 @@ Nix users can build the package or development shell:
 
 ```sh
 nix build
-nix develop
+nix develop --impure --no-update-lock-file
 ```
+
+Run the same validation and LuaRocks packaging graph locally and in CI:
+
+```sh
+nix develop --impure --no-update-lock-file --command devenv tasks run app:ci
+```
+
+For LuaRocks installation and publishing, see [the build contract](docs/build.md).
 
 For NixOS, prefer the included module. It builds the plugin from the host's
 `pkgs`, enables the `xlock` PAM service, installs the helper and Lua module, and
@@ -196,8 +204,8 @@ reports a transient service or module failure, the helper waits briefly and
 recreates that transaction once; ordinary wrong-password results are not
 retried.
 
-The helper starts a native capture worker, waits for its filtered frame, and
-only then maps the lock surface. FFmpeg applies the privacy filter:
+The helper captures and converts one filtered frame before mapping the lock
+surface. FFmpeg applies the privacy filter:
 
 ```text
 noise=alls=10,scale=iw*.05:-1,scale=iw*20:-1:flags=neighbor
@@ -213,6 +221,12 @@ When Xinerama reports multiple active displays, the helper draws the same
 prompt state at the center of every display. Password dots, foreground and
 background colors, and the flashing state are shared, so the prompts remain
 consistent while the lock surface still covers the complete X11 root window.
+
+While idle, the helper waits for X11 or control socket activity without a
+periodic timer. Lua notification delivery uses a nonblocking socket so a busy
+helper cannot stall Awesome's event loop. `notify()` returns false when delivery
+cannot complete immediately. Notification title, text, and level are bounded to
+127, 1023, and 15 bytes respectively, matching the native receiver.
 
 ### Security concerns
 

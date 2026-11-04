@@ -5,7 +5,7 @@ if ffi_available then
     ffi.cdef [[
         int socket(int domain, int type, int protocol);
         int connect(int socket, const void *address, unsigned int address_length);
-        long write(int file_descriptor, const void *buffer, unsigned long count);
+        long send(int socket, const void *buffer, unsigned long count, int flags);
         int close(int file_descriptor);
     ]]
 end
@@ -52,27 +52,27 @@ end
 local function notification_payload(title, text, level)
     local fields = {
         pack_string("type") .. pack_string("notification"),
-        pack_string("title") .. pack_string(title),
-        pack_string("text") .. pack_string(text),
-        pack_string("level") .. pack_string(level or "info"),
+        pack_string("title") .. pack_string(tostring(title or ""):sub(1, 127)),
+        pack_string("text") .. pack_string(tostring(text or ""):sub(1, 1023)),
+        pack_string("level") .. pack_string(tostring(level or "info"):sub(1, 15)),
     }
     return string.char(0x80 + #fields) .. table.concat(fields)
 end
 
 local function send_control_message(path, payload)
-    if not ffi_available or not path then
+    if not ffi_available or type(path) ~= "string" or #path > 107 or path:find("\0", 1, true) then
         return false
     end
 
-    local socket = ffi.C.socket(1, 1, 0) -- AF_UNIX, SOCK_STREAM.
+    -- Linux AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC.
+    local socket = ffi.C.socket(1, 1 + 2048 + 524288, 0)
     if socket < 0 then
         return false
     end
 
     local address = ffi.new("uint8_t[110]")
-    address[0] = 1 -- AF_UNIX, little-endian sa_family_t.
-    address[1] = 0
-    ffi.copy(address + 2, path, math.min(#path, 107))
+    ffi.cast("uint16_t *", address)[0] = 1 -- Native sa_family_t.
+    ffi.copy(address + 2, path, #path)
     local frame = string.char(
         math.floor((#payload + 1) / 16777216) % 256,
         math.floor((#payload + 1) / 65536) % 256,
@@ -86,7 +86,9 @@ local function send_control_message(path, payload)
         ffi.C.close(socket)
         return false
     end
-    local written = ffi.C.write(socket, buffer, #frame)
+    -- MSG_DONTWAIT | MSG_NOSIGNAL keeps Awesome responsive and avoids SIGPIPE
+    -- if the helper closes its socket while a notification is being sent.
+    local written = ffi.C.send(socket, buffer, #frame, 64 + 16384)
     ffi.C.close(socket)
     return written == #frame
 end

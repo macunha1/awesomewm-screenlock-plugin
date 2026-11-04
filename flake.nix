@@ -2,9 +2,25 @@
   description = "AwesomeWM screenlock plugin with a Lua API and XCB/PAM helper";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.devenv = {
+    url = "github:cachix/devenv/v2.4.0";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  nixConfig = {
+    extra-substituters = [ "https://devenv.cachix.org" ];
+    extra-trusted-public-keys = [
+      "devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw="
+    ];
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      devenv,
+      ...
+    }@inputs:
     let
       systems = [
         "x86_64-linux"
@@ -39,32 +55,16 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
-          ffmpeg = pkgs.ffmpeg.override {
-            withXcb = true;
-            withXcbShm = true;
-            withXcbShape = true;
-            withXcbxfixes = true;
-          };
         in
         {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              meson
-              ninja
-              pkg-config
-              luajit
-            ];
-            buildInputs = with pkgs; [
-              libxcb
-              libx11
-              libxft
-              xcbutilkeysyms
-              pam
-              ffmpeg
-            ];
+          default = devenv.lib.mkShell {
+            inherit inputs pkgs;
+            modules = [ ./devenv.nix ];
           };
         }
       );
+
+      formatter = forEachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt);
 
       checks = forEachSystem (
         system:
