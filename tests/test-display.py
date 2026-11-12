@@ -35,6 +35,17 @@ x11.XOpenDisplay.restype = pointer
 x11.XDefaultRootWindow.argtypes = [pointer]
 x11.XDefaultRootWindow.restype = window
 x11.XSetWindowBackground.argtypes = [pointer, window, ctypes.c_ulong]
+x11.XCreateSimpleWindow.argtypes = [pointer, window, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+                                  ctypes.c_ulong, ctypes.c_ulong]
+x11.XCreateSimpleWindow.restype = window
+x11.XMapWindow.argtypes = [pointer, window]
+x11.XUnmapWindow.argtypes = [pointer, window]
+x11.XDestroyWindow.argtypes = [pointer, window]
+x11.XSetInputFocus.argtypes = [pointer, window, ctypes.c_int, ctypes.c_ulong]
+x11.XGrabKeyboard.argtypes = [pointer, window, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_ulong]
+x11.XUngrabKeyboard.argtypes = [pointer, ctypes.c_ulong]
 x11.XClearWindow.argtypes = [pointer, window]
 x11.XSync.argtypes = [pointer, ctypes.c_int]
 x11.XGetInputFocus.argtypes = [pointer, ctypes.POINTER(window), ctypes.POINTER(ctypes.c_int)]
@@ -61,6 +72,21 @@ with tempfile.TemporaryDirectory(prefix="screenlock-display-") as directory:
         root = x11.XDefaultRootWindow(display)
         x11.XSetWindowBackground(display, root, 0xFF0000)
         x11.XClearWindow(display, root)
+
+        def create_client():
+            client = x11.XCreateSimpleWindow(display, root, 600, 400, 100, 100,
+                                             0, 0, 0xFF0000)
+            x11.XMapWindow(display, client)
+            return client
+
+        def input_focus():
+            focused = window()
+            revert_to = ctypes.c_int()
+            x11.XGetInputFocus(display, ctypes.byref(focused), ctypes.byref(revert_to))
+            return focused.value, revert_to.value
+
+        previous_focus = create_client()
+        x11.XSetInputFocus(display, previous_focus, 1, 0)  # RevertToPointerRoot, CurrentTime.
         x11.XSync(display, 0)
         environment = dict(os.environ, DISPLAY=display_name.decode())
         path = f"{directory}/control"
@@ -71,7 +97,7 @@ with tempfile.TemporaryDirectory(prefix="screenlock-display-") as directory:
         def locked():
             assert locker.poll() is None, "helper exited before locking"
             x11.XGetInputFocus(display, ctypes.byref(focus), ctypes.byref(revert))
-            return focus.value not in (0, 1, root)
+            return focus.value not in (0, 1, root, previous_focus)
 
         wait_until(locked)
         time.sleep(0.15)  # Allow the initial expose event to finish.
@@ -102,7 +128,52 @@ assert(screenlock:notify("title", string.rep("x", 20000), "info"))
         wait_until(lambda: pixel() == 0)
         locker.terminate()
         assert locker.wait(timeout=2) == 1, "unexpected helper termination status"
-        print(f"isolated X11 lock, Lua notification, and signal exit passed; idle wakeups: {wakeups}")
+        assert input_focus() == (previous_focus, 1), "previous client focus was not restored"
+        x11.XDestroyWindow(display, previous_focus)
+
+        # Both lock modes use the same teardown as successful authentication.
+        # Include clients that disappear while locked and X11's special targets.
+        wibar = create_client()
+        for integrated in (False, True):
+            command = [helper]
+            if integrated:
+                command += ["--integrated", "--wibar-window", str(wibar)]
+            for target_state in ("viewable", "unmapped", "destroyed", "none", "pointer-root"):
+                client = create_client()
+                previous_focus = {"none": 0, "pointer-root": 1}.get(target_state, client)
+                x11.XSetInputFocus(display, previous_focus, 2, 0)  # RevertToParent.
+                x11.XSync(display, 0)
+                saved_focus = input_focus()
+                locker = subprocess.Popen(command, env=environment)
+                wait_until(locked)
+                if target_state == "unmapped":
+                    x11.XUnmapWindow(display, client)
+                elif target_state == "destroyed":
+                    x11.XDestroyWindow(display, client)
+                x11.XSync(display, 0)
+                locker.terminate()
+                assert locker.wait(timeout=2) == 1, "unexpected helper termination status"
+                restored_focus = input_focus()
+                if target_state in ("unmapped", "destroyed"):
+                    assert restored_focus[0] in (0, 1, root), "focus restored to an unavailable client"
+                else:
+                    assert restored_focus == saved_focus, (integrated, target_state, restored_focus, saved_focus)
+                if target_state != "destroyed":
+                    x11.XDestroyWindow(display, client)
+
+        # Failure to acquire a grab happens after moving focus to the lock.
+        # It must restore the client too, without requiring an unlock callback.
+        previous_focus = create_client()
+        x11.XSetInputFocus(display, previous_focus, 1, 0)
+        assert x11.XGrabKeyboard(display, previous_focus, 0, 1, 1, 0) == 0
+        try:
+            result = subprocess.run([helper], env=environment, timeout=5, check=False)
+            assert result.returncode == 2, "helper should fail when the keyboard is already grabbed"
+            assert input_focus() == (previous_focus, 1), "startup failure did not restore focus"
+        finally:
+            x11.XUngrabKeyboard(display, 0)
+        print("isolated X11 lock, Lua notification, focus restoration, and signal exit passed; "
+              f"idle wakeups: {wakeups}")
     finally:
         if locker is not None and locker.poll() is None:
             locker.kill()

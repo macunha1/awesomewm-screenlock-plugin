@@ -107,6 +107,21 @@ version and matching release tag; do not replace an artifact
 that consumers may already have installed. Reverting the workflow stops future
 uploads but does not retract previous releases.
 
+## Focus restoration
+
+The native helper saves the X11 keyboard focus before mapping the lock surface
+and restores it after releasing input grabs and destroying the surface. Both
+lockdown and integrated mode restore the previous window without requiring
+pointer movement. The same cleanup applies when helper startup fails after
+taking focus or the helper handles a termination signal.
+
+X11 has one keyboard focus across all monitors. Awesome's per-screen client
+history stays with Awesome; the helper restores the single active focus target
+and its X11 reversion policy. If that window closes or becomes unviewable while
+locked, restoration is skipped by the X server. The helper does not select a
+replacement window or switch tags. Abrupt termination (e.g. `SIGKILL`) cannot
+run this cleanup.
+
 ## Toolchain updates and caches
 
 Update inputs explicitly with `nix flake update`, review `flake.lock`, and rerun

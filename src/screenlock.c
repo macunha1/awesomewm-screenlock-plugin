@@ -54,6 +54,9 @@ struct lock_state {
     xcb_connection_t *connection;
     xcb_screen_t *screen;
     xcb_window_t window;
+    xcb_window_t previous_focus;
+    uint8_t previous_focus_revert;
+    int focus_changed;
     xcb_gcontext_t graphics;
     xcb_key_symbols_t *key_symbols;
     pam_handle_t *pam;
@@ -985,6 +988,7 @@ static int create_lock_window(struct lock_state *state)
     uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_OVERRIDE_REDIRECT;
     xcb_grab_keyboard_reply_t *keyboard_reply;
     xcb_grab_pointer_reply_t *pointer_reply;
+    xcb_get_input_focus_reply_t *focus_reply;
     xcb_void_cookie_t cookie;
 
     if (!state->lockdown_enabled && state->wibar_window_count == 0) {
@@ -994,6 +998,17 @@ static int create_lock_window(struct lock_state *state)
         );
         return 0;
     }
+
+    /* X11 has one keyboard focus across all monitors. Save it before mapping
+     * the lock surface; Awesome retains its own per-screen focus history. */
+    focus_reply = xcb_get_input_focus_reply(
+        state->connection, xcb_get_input_focus(state->connection), NULL
+    );
+    if (focus_reply == NULL)
+        return 0;
+    state->previous_focus = focus_reply->focus;
+    state->previous_focus_revert = focus_reply->revert_to;
+    free(focus_reply);
 
     if (!state->lockdown_enabled) {
         uint32_t event_mask = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
@@ -1036,6 +1051,7 @@ static int create_lock_window(struct lock_state *state)
     }
     xcb_set_input_focus(state->connection, XCB_INPUT_FOCUS_PARENT,
                         state->window, XCB_CURRENT_TIME);
+    state->focus_changed = 1;
 
     if (!state->lockdown_enabled)
         return xcb_connection_has_error(state->connection) == 0;
@@ -1092,6 +1108,16 @@ static void destroy_lock_window(struct lock_state *state)
     xcb_ungrab_keyboard(state->connection, XCB_CURRENT_TIME);
     if (state->window != XCB_NONE)
         xcb_destroy_window(state->connection, state->window);
+    if (state->focus_changed) {
+        /* A client may close or become unviewable while locked. Consume the
+         * resulting BadWindow/BadMatch without interfering with teardown. */
+        xcb_void_cookie_t cookie = xcb_set_input_focus_checked(
+            state->connection, state->previous_focus_revert,
+            state->previous_focus, XCB_CURRENT_TIME
+        );
+        free(xcb_request_check(state->connection, cookie));
+        state->focus_changed = 0;
+    }
     if (state->graphics != XCB_NONE)
         xcb_free_gc(state->connection, state->graphics);
     xcb_flush(state->connection);
